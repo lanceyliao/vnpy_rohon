@@ -40,6 +40,9 @@ from ..api import (
     THOST_FTDC_OST_PartTradedNotQueueing,
     THOST_FTDC_OST_AllTraded,
     THOST_FTDC_OST_Canceled,
+    THOST_FTDC_OST_Unknown,
+    THOST_FTDC_OST_NotTouched,
+    THOST_FTDC_OST_Touched,
     THOST_FTDC_D_Buy,
     THOST_FTDC_D_Sell,
     THOST_FTDC_PD_Long,
@@ -75,6 +78,9 @@ STATUS_ROHON2VT: dict[str, Status] = {
     THOST_FTDC_OST_AllTraded: Status.ALLTRADED,
     THOST_FTDC_OST_Canceled: Status.CANCELLED,
     THOST_FTDC_OST_PartTradedNotQueueing: Status.CANCELLED,
+    THOST_FTDC_OST_Unknown: Status.SUBMITTING,
+    THOST_FTDC_OST_NotTouched: Status.SUBMITTING,
+    THOST_FTDC_OST_Touched: Status.SUBMITTING,
 }
 
 # 多空方向映射
@@ -254,24 +260,28 @@ class RohonGateway(BaseGateway):
         appid: str = setting["产品名称"]
         auth_code: str = setting["授权编码"]
 
-        if not td_address.startswith("tcp://"):
+        if td_address and not td_address.startswith("tcp://"):
             td_address = "tcp://" + td_address
 
-        md_addresses: list[str] = [
-            addr if (
-                addr.startswith("tcp://")
-                or addr.startswith("ssl://")
-                or addr.startswith("socks")
-            ) else f"tcp://{addr}"
-            for addr in expand_domain_template(md_address)
-        ]
+        if md_address:
+            md_addresses: list[str] = [
+                addr if (
+                    addr.startswith("tcp://")
+                    or addr.startswith("ssl://")
+                    or addr.startswith("socks")
+                ) else f"tcp://{addr}"
+                for addr in expand_domain_template(md_address)
+            ]
 
         self._set_limit_retry(not self._load_limit_prices())
 
-        self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
-        self.md_api.connect(md_addresses, userid, password, brokerid, True)
+        if td_address:
+            self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
+            self.init_query()
 
-        self.init_query()
+        if md_address:
+            self.md_api.connect(md_addresses, userid, password, brokerid, True)
+
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
