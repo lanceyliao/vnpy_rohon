@@ -5,7 +5,9 @@
 
 #include "vnrohon.h"
 #include "pybind11/pybind11.h"
+#include "pybind11/stl.h"
 #include "rohon/ThostFtdcMdApi.h"
+#include <vector>
 
 
 using namespace pybind11;
@@ -193,7 +195,11 @@ public:
 
 	int subscribeMarketData(string instrumentID);
 
+	int subscribeMarketData(const vector<string>& instrumentIDs);
+
 	int unSubscribeMarketData(string instrumentID);
+
+	int unSubscribeMarketData(const vector<string>& instrumentIDs);
 
 	int subscribeForQuoteRsp(string instrumentID);
 

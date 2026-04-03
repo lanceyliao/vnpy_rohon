@@ -1,4 +1,5 @@
 import sys
+from collections import deque
 from datetime import datetime, timedelta
 from time import sleep
 from pathlib import Path
@@ -183,6 +184,10 @@ class RohonGateway(BaseGateway):
         """订阅行情"""
         self.md_api.subscribe(req)
 
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """退订行情"""
+        self.md_api.unsubscribe(req)
+
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
         return self.td_api.send_order(req)
@@ -213,6 +218,8 @@ class RohonGateway(BaseGateway):
 
     def process_timer_event(self, event: Event) -> None:
         """定时事件处理"""
+        self.md_api.flush_subscribe_queue()
+
         self.count += 1
         if self.count < 2:
             return
@@ -244,7 +251,8 @@ class RohonMdApi(MdApi):
 
         self.connect_status: bool = False
         self.login_status: bool = False
-        self.subscribed: set = set()
+        self.subscribed: set[str] = set()
+        self.subscribe_queue: deque[tuple[str, bool]] = deque()
 
         self.userid: str = ""
         self.password: str = ""
@@ -269,7 +277,7 @@ class RohonMdApi(MdApi):
             self.gateway.write_log("行情服务器登录成功")
 
             for symbol in self.subscribed:
-                self.subscribeMarketData(symbol)
+                self.subscribe_queue.append((symbol, True))
         else:
             self.gateway.write_error("行情服务器登录失败", error)
 
@@ -383,9 +391,42 @@ class RohonMdApi(MdApi):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
-        if self.login_status:
-            self.subscribeMarketData(req.symbol)
-        self.subscribed.add(req.symbol)
+        symbol: str = req.symbol
+        self.subscribed.add(symbol)
+        self.subscribe_queue.append((symbol, True))
+
+    def unsubscribe(self, req: SubscribeRequest) -> None:
+        """退订行情"""
+        symbol: str = req.symbol
+        self.subscribed.discard(symbol)
+        self.subscribe_queue.append((symbol, False))
+
+    def flush_subscribe_queue(self) -> None:
+        """定时批量发送订阅/退订请求"""
+        if not self.login_status:
+            return
+
+        latest_actions: dict[str, bool] = {}
+
+        while self.subscribe_queue:
+            symbol, subscribe = self.subscribe_queue.popleft()
+            latest_actions[symbol] = subscribe
+
+        if not latest_actions:
+            return
+
+        subscribe_symbols: list[str] = [
+            symbol for symbol, subscribe in latest_actions.items() if subscribe
+        ]
+        unsubscribe_symbols: list[str] = [
+            symbol for symbol, subscribe in latest_actions.items() if not subscribe
+        ]
+
+        if subscribe_symbols:
+            self.subscribeMarketData(subscribe_symbols)
+
+        if unsubscribe_symbols:
+            self.unSubscribeMarketData(unsubscribe_symbols)
 
     def close(self) -> None:
         """关闭连接"""
