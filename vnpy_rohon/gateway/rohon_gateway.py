@@ -1,8 +1,10 @@
+import json
 import sys
 from collections import deque
 from datetime import datetime, timedelta
 from time import sleep
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from vnpy.event import EventEngine, Event
 from vnpy.trader.constant import (
@@ -159,6 +161,8 @@ class RohonGateway(BaseGateway):
         self.md_api: RohonMdApi = RohonMdApi(self)
 
         self.count: int = 0
+        self._limit_price_cache: dict[str, dict[str, float]] = {}
+        self._limit_retry_registered: bool = False
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -174,6 +178,8 @@ class RohonGateway(BaseGateway):
             td_address = "tcp://" + td_address
         if not md_address.startswith("tcp://"):
             md_address = "tcp://" + md_address
+
+        self._set_limit_retry(not self._load_limit_prices())
 
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
         self.md_api.connect(md_address, userid, password, brokerid)
@@ -236,6 +242,68 @@ class RohonGateway(BaseGateway):
         self.query_functions: list = [self.query_account, self.query_position]
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
+    def on_contract(self, contract: ContractData) -> None:
+        """合约信息推送"""
+        self._apply_limit_prices(contract)
+        super().on_contract(contract)
+
+    def _apply_limit_prices(self, contract: ContractData) -> None:
+        """把缓存中的涨跌停价写回合约对象"""
+        if contract.extra is None:
+            contract.extra = {}
+        contract.extra.update(self._limit_price_cache.get(contract.vt_symbol, {}))
+
+    def _backfill_published_contracts(self) -> None:
+        """通过on_contract重发已发布合约"""
+        for contract in list(symbol_contract_map.values()):
+            self.on_contract(contract)
+
+    def _set_limit_retry(self, active: bool) -> None:
+        """切换涨跌停HTTP重试定时器"""
+        if active == self._limit_retry_registered:
+            return
+
+        if active:
+            self.event_engine.register(EVENT_TIMER, self._on_limit_retry_timer)
+            self.write_log("涨跌停价首次加载失败，已注册EVENT_TIMER定时重试")
+        else:
+            self.event_engine.unregister(EVENT_TIMER, self._on_limit_retry_timer)
+
+        self._limit_retry_registered = active
+
+    def _on_limit_retry_timer(self, event: Event) -> None:
+        """EVENT_TIMER回调：定时重试HTTP加载涨跌停"""
+        if self._load_limit_prices():
+            self._backfill_published_contracts()
+            self._set_limit_retry(False)
+            self.write_log("涨跌停价定时重试成功，已通过on_contract重发已发布合约并注销EVENT_TIMER重试")
+
+    def _load_limit_prices(self) -> bool:
+        """通过HTTP加载涨跌停缓存"""
+        request: Request = Request("http://dict.openctp.cn/prices?types=futures")
+
+        try:
+            with urlopen(request, timeout=5) as response:
+                encoding: str = response.headers.get_content_charset() or "utf-8"
+                payload = json.loads(response.read().decode(encoding, errors="replace"))
+
+            data: list | None = payload.get("data") if isinstance(payload, dict) else None
+            if payload.get("rsp_code") not in (None, 0, "0", 200, "200") or not isinstance(data, list):
+                return False
+
+            cache: dict[str, dict[str, float]] = {}
+            for item in data:
+                cache[f"{item['InstrumentID']}.{item['ExchangeID']}"] = {
+                    "limit_up": item["UpperLimitPrice"],
+                    "limit_down": item["LowerLimitPrice"],
+                }
+
+            self._limit_price_cache = cache
+            self.write_log(f"涨跌停价加载成功，缓存键数量：{len(cache)}")
+            return True
+        except Exception:
+            self.write_log("涨跌停价加载失败")
+            return False
 
 class RohonMdApi(MdApi):
     """"""
@@ -639,6 +707,8 @@ class RohonTdApi(TdApi):
                 product=product,
                 size=data["VolumeMultiple"],
                 pricetick=data["PriceTick"],
+                min_volume=data["MinLimitOrderVolume"],
+                max_volume=data["MaxLimitOrderVolume"],
                 gateway_name=self.gateway_name
             )
 
@@ -657,9 +727,8 @@ class RohonTdApi(TdApi):
                 contract.option_listed = datetime.strptime(data["OpenDate"], "%Y%m%d")
                 contract.option_expiry = datetime.strptime(data["ExpireDate"], "%Y%m%d")
 
-            self.gateway.on_contract(contract)
-
             symbol_contract_map[contract.symbol] = contract
+            self.gateway.on_contract(contract)
 
         if last:
             self.contract_inited = True
