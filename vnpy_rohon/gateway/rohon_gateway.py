@@ -783,8 +783,7 @@ class RohonTdApi(TdApi):
             traded=data["VolumeTraded"],
             status=STATUS_ROHON2VT[data["OrderStatus"]],
             datetime=dt,
-            gateway_name=self.gateway_name,
-            reference=data.get("OrderMemo", "")
+            gateway_name=self.gateway_name
         )
         self.gateway.on_order(order)
 
