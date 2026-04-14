@@ -679,7 +679,7 @@ class RohonTdApi(TdApi):
                 position.yd_volume = data["Position"] - data["TodayPosition"]
 
             # 获取合约的乘数信息
-            size: int = contract.size
+            size: float = contract.size
 
             # 计算之前已有仓位的持仓总成本
             cost: float = position.price * position.volume * size
@@ -790,9 +790,7 @@ class RohonTdApi(TdApi):
 
         tp: tuple = (data["OrderPriceType"], data["TimeCondition"], data["VolumeCondition"])
         if tp not in ORDERTYPE_ROHON2VT:
-            print("收到不支持类型的委托推送--------------")
-            print("委托类型", tp)
-            print(data)
+            self.gateway.write_log("收到不支持类型的委托推送--------------\n委托类型{tp}\n{data}")
             return
 
         order: OrderData = OrderData(
