@@ -820,7 +820,12 @@ class RohonTdApi(TdApi):
         symbol: str = data["InstrumentID"]
         contract: ContractData = symbol_contract_map[symbol]
 
-        orderid: str = self.sysid_orderid_map[data["OrderSysID"]]
+        tradeid: str = data["TradeID"]
+        # orderid: str = self.sysid_orderid_map[data["OrderSysID"]]
+        orderid: str | None = self.sysid_orderid_map.get(data["OrderSysID"], None)
+        if not orderid:
+            self.gateway.write_log(f"error: 成交回报先于委托回报\n{data}")
+            orderid = tradeid
 
         timestamp: str = f"{data['TradeDate']} {data['TradeTime']}"
         dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S")
@@ -838,7 +843,7 @@ class RohonTdApi(TdApi):
             symbol=symbol,
             exchange=contract.exchange,
             orderid=orderid,
-            tradeid=data["TradeID"],
+            tradeid=tradeid,
             direction=DIRECTION_ROHON2VT[data["Direction"]],
             offset=OFFSET_ROHON2VT[data["OffsetFlag"]],
             price=data["Price"],
