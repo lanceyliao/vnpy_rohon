@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 from collections import deque
 from datetime import datetime, timedelta
@@ -32,7 +33,6 @@ from vnpy.trader.utility import get_folder_path, ZoneInfo
 from vnpy.trader.event import EVENT_TIMER
 
 from ..api import (
-    MdApi,
     TdApi,
     THOST_FTDC_OST_NoTradeQueueing,
     THOST_FTDC_OST_PartTradedQueueing,
@@ -65,6 +65,7 @@ from ..api import (
     THOST_FTDC_AF_Delete
 )
 
+from vnpy_ctp.api import MdApi
 
 # 委托状态映射
 STATUS_ROHON2VT: dict[str, Status] = {
@@ -158,7 +159,7 @@ class RohonGateway(BaseGateway):
         super().__init__(event_engine, gateway_name)
 
         self.td_api: RohonTdApi = RohonTdApi(self)
-        self.md_api: RohonMdApi = RohonMdApi(self)
+        self.md_api: CtpMdApi = CtpMdApi(self)
 
         self.count: int = 0
         self._limit_price_cache: dict[str, dict[str, float]] = {}
@@ -176,13 +177,20 @@ class RohonGateway(BaseGateway):
 
         if not td_address.startswith("tcp://"):
             td_address = "tcp://" + td_address
-        if not md_address.startswith("tcp://"):
-            md_address = "tcp://" + md_address
+
+        md_addresses: list[str] = [
+            addr if (
+                addr.startswith("tcp://")
+                or addr.startswith("ssl://")
+                or addr.startswith("socks")
+            ) else f"tcp://{addr}"
+            for addr in expand_domain_template(md_address)
+        ]
 
         self._set_limit_retry(not self._load_limit_prices())
 
         self.td_api.connect(td_address, userid, password, brokerid, auth_code, appid)
-        self.md_api.connect(md_address, userid, password, brokerid)
+        self.md_api.connect(md_addresses, userid, password, brokerid, True)
 
         self.init_query()
 
@@ -305,8 +313,8 @@ class RohonGateway(BaseGateway):
             self.write_log("涨跌停价加载失败")
             return False
 
-class RohonMdApi(MdApi):
-    """"""
+
+class CtpMdApi(MdApi):
 
     def __init__(self, gateway: RohonGateway) -> None:
         """构造函数"""
@@ -321,6 +329,7 @@ class RohonMdApi(MdApi):
         self.login_status: bool = False
         self.subscribed: set[str] = set()
         self.subscribe_queue: deque[tuple[str, bool]] = deque()
+        self.symbol_exchange_map: dict[str, Exchange] = {}
 
         self.userid: str = ""
         self.password: str = ""
@@ -340,7 +349,7 @@ class RohonMdApi(MdApi):
 
     def onRspUserLogin(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """用户登录请求回报"""
-        if not error or not error["ErrorID"]:
+        if not error["ErrorID"]:
             self.login_status = True
             self.gateway.write_log("行情服务器登录成功")
 
@@ -368,25 +377,34 @@ class RohonMdApi(MdApi):
 
         # 过滤还没有收到合约数据前的行情推送
         symbol: str = data["InstrumentID"]
-        contract: ContractData = symbol_contract_map.get(symbol, None)
-        if not contract:
+        contract: ContractData | None = symbol_contract_map.get(symbol, None)
+
+        exchange: Exchange | None = None
+        name: str = symbol
+        if contract:
+            exchange = contract.exchange
+            name = contract.name
+        else:
+            exchange = self.symbol_exchange_map.get(symbol, None)
+
+        if not exchange:
             return
 
         # 对大商所的交易日字段取本地日期
-        if not data["ActionDay"] or contract.exchange in {Exchange.DCE, Exchange.GFEX}:
+        if not data["ActionDay"] or exchange == Exchange.DCE:
             date_str: str = self.current_date
         else:
             date_str = data["ActionDay"]
 
-        timestamp: str = f"{date_str} {data['UpdateTime']}.{int(data['UpdateMillisec']/100)}"
+        timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']}"
         dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S.%f")
         dt = dt.replace(tzinfo=CHINA_TZ)
 
         tick: TickData = TickData(
             symbol=symbol,
-            exchange=contract.exchange,
+            exchange=exchange,
             datetime=dt,
-            name=contract.name,
+            name=name,
             volume=data["Volume"],
             turnover=data["Turnover"],
             open_interest=data["OpenInterest"],
@@ -427,7 +445,14 @@ class RohonMdApi(MdApi):
 
         self.gateway.on_tick(tick)
 
-    def connect(self, address: str, userid: str, password: str, brokerid: str) -> None:
+    def connect(
+        self,
+        addresses: list[str],
+        userid: str,
+        password: str,
+        brokerid: str,
+        production_mode: bool
+    ) -> None:
         """连接服务器"""
         self.userid = userid
         self.password = password
@@ -436,15 +461,13 @@ class RohonMdApi(MdApi):
         # 禁止重复发起连接，会导致异常崩溃
         if not self.connect_status:
             path: Path = get_folder_path(self.gateway_name.lower())
-            self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"))
+            self.createFtdcMdApi((str(path) + "\\Md").encode("GBK"), production_mode)
 
-            self.registerFront(address)
+            for address in addresses:
+                self.registerFront(address)
             self.init()
 
             self.connect_status = True
-        # 如果已连接，立即登录
-        elif not self.login_status:
-            self.login()
 
     def login(self) -> None:
         """用户登录"""
@@ -460,6 +483,7 @@ class RohonMdApi(MdApi):
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         symbol: str = req.symbol
+        self.symbol_exchange_map[symbol] = req.exchange
         self.subscribed.add(symbol)
         self.subscribe_queue.append((symbol, True))
 
@@ -980,3 +1004,25 @@ def adjust_price(price: float) -> float:
     if price == MAX_FLOAT:
         price = 0
     return price
+
+
+def expand_domain_template(address: str) -> list[str]:
+    """将域名模板扩展为实际地址列表"""
+    match = re.search(r"{([0-9,/]+)}", address)
+    if match:
+        ranges_str: str = match.group(1)
+        numbers: set[int] = set()
+
+        for part in ranges_str.split(","):
+            if "/" in part:
+                start, end = map(int, part.split("/"))
+                numbers.update(range(start, end + 1))
+            else:
+                numbers.add(int(part))
+
+        return [address.replace(match.group(0), str(i)) for i in sorted(numbers)]
+
+    if "," in address:
+        return [addr.strip() for addr in address.split(",") if addr.strip()]
+
+    return [address]
