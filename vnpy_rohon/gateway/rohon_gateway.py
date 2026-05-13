@@ -138,6 +138,13 @@ symbol_contract_map: dict[str, ContractData] = {}
 class Settlement:
     """结算单：settlement_cap 拼包；_begin 固定 trading_day、userid 并生成文件名「结算单_{userid}_{周期}.txt」；末包 _seal(text)；_save 只拼目录。"""
 
+    @staticmethod
+    def default_qday() -> str:
+        """未指定交易日时：上海时区当前时刻早于 18:00 用前一自然日，否则用当天。yyyymmdd。"""
+        now = datetime.now(CHINA_TZ)
+        d = (now.date() - timedelta(days=1)) if now.hour < 18 else now.date()
+        return d.strftime("%Y%m%d")
+
     def __init__(self) -> None:
         self.chunks: list[bytes] = []
         self.reqid: int | None = None
@@ -283,7 +290,7 @@ class RohonGateway(BaseGateway):
         self.td_api.query_position()
 
     def query_settlement(self, trading_day: str = "") -> None:
-        """查询结算单；不传则为上海时区当天自然日 yyyymmdd；可传 yyyymmdd 或月结 yymm。"""
+        """查询结算单；不传则用 Settlement.default_qday()（上海早于 18:00 为前一自然日）；可传 yyyymmdd 或月结 yymm。"""
         self.td_api.query_settlement(trading_day)
 
     def get_settlement(self, trading_day: str) -> str | None:
@@ -745,7 +752,7 @@ class RohonTdApi(TdApi):
             return
 
         self.gateway.write_log(
-            "结算信息查询完成，正文为空（可 query_settlement() 用当天自然日，或传入 yyyymmdd / 月结 yymm）"
+            "结算信息查询完成，正文为空（可 query_settlement() 用 default_qday，或显式传入 yyyymmdd / yymm）"
         )
         cap._clear_pending()
 
@@ -1114,12 +1121,12 @@ class RohonTdApi(TdApi):
         self.reqQryInvestorPosition(req, self.reqid)
 
     def query_settlement(self, trading_day: str = "") -> None:
-        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用上海时区当天自然日 yyyymmdd（请求体与缓存键一致）。可传 yyyymmdd 或月结 yymm。"""
+        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海早于 18:00 为前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
         if not self.login_status:
             self.gateway.write_log("尚未登录交易，跳过查询结算信息")
             return
 
-        qday: str = trading_day or datetime.now(CHINA_TZ).strftime("%Y%m%d")
+        qday: str = trading_day or Settlement.default_qday()
         req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid,
