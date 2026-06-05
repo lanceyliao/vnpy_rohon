@@ -240,6 +240,7 @@ class RohonGateway(BaseGateway):
         self.count: int = 0
         self._limit_price_cache: dict[str, dict[str, float]] = {}
         self._limit_retry_registered: bool = False
+        self.orders: dict[str, OrderData] = {}
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -303,6 +304,10 @@ class RohonGateway(BaseGateway):
         st: Settlement | None = self.td_api.settlements.get(trading_day)
         return st.text if st else None
 
+    def query_order(self, orderid: str = "") -> None:
+        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
+        self.td_api.query_order(orderid)
+
     def close(self) -> None:
         """关闭接口"""
         self.td_api.close()
@@ -339,6 +344,25 @@ class RohonGateway(BaseGateway):
         """合约信息推送"""
         self._apply_limit_prices(contract)
         super().on_contract(contract)
+
+    def on_order(self, order: OrderData) -> None:
+        """仅推送有效增量：成交量上涨，或成交量不变但状态变化"""
+        last_order: OrderData | None = self.orders.get(order.orderid)
+        if last_order:
+            if not last_order.is_active():
+                self.write_log(
+                    f"忽略订单回报，订单号：{order.orderid}，状态：{order.status}，"
+                    f"已成交：{order.traded}，剩余：{order.volume - order.traded}"
+                )
+                return
+
+            traded_change: float = order.traded - last_order.traded
+            status_change: bool = order.status != last_order.status
+            if traded_change < 0 or (traded_change == 0 and not status_change):
+                return
+
+        self.orders[order.orderid] = order
+        super().on_order(order)
 
     def _apply_limit_prices(self, contract: ContractData) -> None:
         """把缓存中的涨跌停价写回合约对象"""
@@ -647,6 +671,7 @@ class RohonTdApi(TdApi):
         self.trade_data: list[dict] = []
         self.positions: dict[str, PositionData] = {}
         self.sysid_orderid_map: dict[str, str] = {}
+        self.orderid_sysid_map: dict[str, str] = {}
 
         self.settlements: dict[str, Settlement] = {}
         self.settlement_cap: Settlement = Settlement()
@@ -852,6 +877,24 @@ class RohonTdApi(TdApi):
 
         self.gateway.on_account(account)
 
+    def query_order(self, orderid: str = "") -> int:
+        """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
+        rohon_req: dict = {
+            "BrokerID": self.brokerid,
+            "InvestorID": self.userid
+        }
+        if orderid:
+            # 通过 orderid_sysid_map 反向查找 OrderSysID
+            order_sysid = self.orderid_sysid_map.get(orderid)
+            if order_sysid:
+                rohon_req["OrderSysID"] = order_sysid
+            else:
+                # 如果找不到 OrderSysID，则查询全部订单
+                pass
+
+        n: int = self.reqQryOrder(rohon_req, self.reqid)
+        return n
+
     def onRspQryInstrument(self, data: dict, error: dict, reqid: int, last: bool) -> None:
         """合约查询回报"""
         product: Product = PRODUCT_ROHON2VT.get(data["ProductClass"], None)
@@ -942,6 +985,7 @@ class RohonTdApi(TdApi):
         self.gateway.on_order(order)
 
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
+        self.orderid_sysid_map[orderid] = data["OrderSysID"]
 
     def onRtnTrade(self, data: dict) -> None:
         """成交数据推送"""
