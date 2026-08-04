@@ -999,6 +999,14 @@ class RohonTdApi(TdApi):
         self.sysid_orderid_map[data["OrderSysID"]] = orderid
         self.orderid_sysid_map[orderid] = data["OrderSysID"]
 
+        # 特殊情况撤单（非交易时段、资金不足等）的日志输出
+        status_msg: str = data.get("StatusMsg", "")
+        if (
+            data["OrderStatus"] == THOST_FTDC_OST_Canceled
+            and status_msg != "已撤单"       # 过滤正常撤单
+        ):
+            self.gateway.write_error(f"委托 {orderid} 状态更新，{status_msg}")
+
     def onRtnTrade(self, data: dict) -> None:
         """成交数据推送"""
         if not self.contract_inited:
