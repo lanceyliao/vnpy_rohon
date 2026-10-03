@@ -1,3 +1,5 @@
+"""实现融航资管交易接口。"""
+
 import json
 import re
 import sys
@@ -440,6 +442,7 @@ class RohonGateway(BaseGateway):
 
 
 class CtpMdApi(MdApi):
+    """行情接口。"""
 
     def __init__(self, gateway: RohonGateway) -> None:
         """构造函数"""
@@ -656,7 +659,7 @@ class CtpMdApi(MdApi):
 
 
 class RohonTdApi(TdApi):
-    """"""
+    """对接融航资管的交易接口。"""
 
     def __init__(self, gateway: RohonGateway) -> None:
         """构造函数"""
