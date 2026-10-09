@@ -1,11 +1,12 @@
 """实现融航资管交易接口。"""
 
 import json
+import os
 import re
 from collections.abc import Callable
 import sys
+from math import ceil
 from collections import deque
-import os
 from datetime import datetime, timedelta
 from time import sleep
 from pathlib import Path
@@ -147,7 +148,7 @@ symbol_contract_map: dict[str, ContractData] = {}
 
 
 class Settlement:
-    """结算单：settlement_cap 拼包；_begin 固定 trading_day、userid 并生成文件名「结算单_{userid}_{周期}.txt」；末包 _seal(text)；_save 只拼目录。"""
+    """结算单：settlement_cap 拼包；_begin 固定 trading_day、userid 并生成「结算单_{userid}_{周期}.txt」；末包 _seal(text)；_save 只拼目录。"""
 
     @staticmethod
     def default_qday() -> str:
@@ -249,6 +250,8 @@ class RohonGateway(BaseGateway):
         self.settlements: dict[str, Settlement] = self.td_api.settlements
 
         self.count: int = 0
+        interval: float = event_engine._interval or 1
+        self.query_interval: int = max(1, ceil(2 / interval))
         self._limit_price_cache: dict[str, dict[str, float]] = {}
         self._limit_retry_registered: bool = False
         self.orders: dict[str, OrderData] = {}
@@ -285,7 +288,6 @@ class RohonGateway(BaseGateway):
 
         if md_address:
             self.md_api.connect(md_addresses, userid, password, brokerid, True)
-
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
@@ -333,23 +335,20 @@ class RohonGateway(BaseGateway):
         """输出错误信息日志"""
         error_id: int = error["ErrorID"]
         error_msg: str = error["ErrorMsg"]
-        msg = f"{msg}，代码：{error_id}，信息：{error_msg}"
-        self.write_log(msg)
+
+        log_msg: str = f"{msg}，代码：{error_id}，信息：{error_msg}"
+        self.write_log(log_msg)
 
     def process_timer_event(self, event: Event) -> None:
         """定时事件处理"""
-        self.md_api.flush_subscribe_queue()
-
         self.count += 1
-        if self.count < 2:
+        if self.count < self.query_interval:
             return
         self.count = 0
 
         func: Callable[[], None] = self.query_functions.pop(0)
         func()
         self.query_functions.append(func)
-
-        self.md_api.update_date()
 
     def init_query(self) -> None:
         """初始化查询任务"""
@@ -466,6 +465,10 @@ class CtpMdApi(MdApi):
 
         self.current_date: str = datetime.now().strftime("%Y%m%d")
 
+        # 订阅队列刷新计数器
+        self.sub_count: int = 0
+        self.sub_interval: int = 0  # 将在 connect 时设置
+
     def onFrontConnected(self) -> None:
         """服务器连接成功回报"""
         self.gateway.write_log("行情服务器连接成功")
@@ -481,6 +484,9 @@ class CtpMdApi(MdApi):
         if not error["ErrorID"]:
             self.login_status = True
             self.gateway.write_log("行情服务器登录成功")
+
+            # 注册定时器用于刷新订阅队列和更新日期
+            self.gateway.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
             symbol: str
             for symbol in self.subscribed:
@@ -526,7 +532,7 @@ class CtpMdApi(MdApi):
         else:
             date_str = data["ActionDay"]
 
-        timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']}"
+        timestamp: str = f"{date_str} {data['UpdateTime']}.{data['UpdateMillisec']:03d}"
         dt: datetime = datetime.strptime(timestamp, "%Y%m%d %H:%M:%S.%f")
         dt = dt.replace(tzinfo=CHINA_TZ)
 
@@ -588,6 +594,10 @@ class CtpMdApi(MdApi):
         self.password = password
         self.brokerid = brokerid
 
+        # 设置订阅刷新间隔
+        interval: float = self.gateway.event_engine._interval or 1
+        self.sub_interval = max(1, ceil(1 / interval))
+
         # 禁止重复发起连接，会导致异常崩溃
         if not self.connect_status:
             path: Path = get_folder_path(self.gateway_name.lower())
@@ -628,6 +638,12 @@ class CtpMdApi(MdApi):
         if not self.login_status:
             return
 
+        # 计数器控制刷新频率
+        self.sub_count += 1
+        if self.sub_count < self.sub_interval:
+            return
+        self.sub_count = 0
+
         latest_actions: dict[str, bool] = {}
 
         while self.subscribe_queue:
@@ -649,6 +665,11 @@ class CtpMdApi(MdApi):
 
         if unsubscribe_symbols:
             self.unSubscribeMarketData(unsubscribe_symbols)
+
+    def process_timer_event(self, event: Event) -> None:
+        """定时事件处理"""
+        self.flush_subscribe_queue()
+        self.update_date()
 
     def close(self) -> None:
         """关闭连接"""
@@ -760,6 +781,7 @@ class RohonTdApi(TdApi):
             status=Status.REJECTED,
             gateway_name=self.gateway_name
         )
+        # 添加拒单原因，供下游解析错误码和信息
         order.rejected_reason = json.dumps({"code": error["ErrorID"], "msg": error["ErrorMsg"]}, ensure_ascii=False)
         self.gateway.on_order(order)
 
@@ -900,7 +922,7 @@ class RohonTdApi(TdApi):
 
     def query_order(self, orderid: str = "") -> int:
         """查询委托；可传入 orderid 查询特定订单，不传则查询全部"""
-        rohon_req: dict = {
+        req: dict = {
             "BrokerID": self.brokerid,
             "InvestorID": self.userid
         }
@@ -908,13 +930,13 @@ class RohonTdApi(TdApi):
             # 通过 orderid_sysid_map 反向查找 OrderSysID
             order_sysid = self.orderid_sysid_map.get(orderid)
             if order_sysid:
-                rohon_req["OrderSysID"] = order_sysid
+                req["OrderSysID"] = order_sysid
             else:
                 # 如果找不到 OrderSysID，则查询全部订单
                 pass
 
         self.reqid += 1
-        n: int = self.reqQryOrder(rohon_req, self.reqid)
+        n: int = self.reqQryOrder(req, self.reqid)
         return n
 
     def onRspQryOrder(self, data: dict, error: dict, reqid: int, last: bool) -> None:
@@ -998,7 +1020,7 @@ class RohonTdApi(TdApi):
 
         tp: tuple = (data["OrderPriceType"], data["TimeCondition"], data["VolumeCondition"])
         if tp not in ORDERTYPE_ROHON2VT:
-            self.gateway.write_log("收到不支持类型的委托推送--------------\n委托类型{tp}\n{data}")
+            self.gateway.write_log(f"收到不支持类型的委托推送--------------\n委托类型{tp}\n{data}")
             return
 
         order: OrderData = OrderData(
@@ -1026,7 +1048,7 @@ class RohonTdApi(TdApi):
             data["OrderStatus"] == THOST_FTDC_OST_Canceled
             and status_msg != "已撤单"       # 过滤正常撤单
         ):
-            self.gateway.write_error(f"委托 {orderid} 状态更新，{status_msg}")
+            self.gateway.write_log(f"委托 {orderid} 状态更新，{status_msg}")
 
     def onRtnTrade(self, data: dict) -> None:
         """成交数据推送"""
@@ -1139,6 +1161,7 @@ class RohonTdApi(TdApi):
         if req.type not in ORDERTYPE_VT2ROHON:
             self.gateway.write_log(f"当前接口不支持该类型的委托{req.type.value}")
             return ""
+
         self.order_ref += 1
 
         tp: tuple = ORDERTYPE_VT2ROHON[req.type]
@@ -1147,7 +1170,7 @@ class RohonTdApi(TdApi):
         volume_condition: str
         price_type, time_condition, volume_condition = tp
 
-        rohon_req: dict = {
+        req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "LimitPrice": req.price,
@@ -1169,7 +1192,7 @@ class RohonTdApi(TdApi):
         }
 
         self.reqid += 1
-        n: int = self.reqOrderInsert(rohon_req, self.reqid)
+        n: int = self.reqOrderInsert(req, self.reqid)
         if n:
             self.gateway.write_log(f"委托请求发送失败，错误代码：{n}")
             return ""
@@ -1187,7 +1210,7 @@ class RohonTdApi(TdApi):
         order_ref: str
         frontid, sessionid, order_ref = req.orderid.split("_")
 
-        rohon_req: dict = {
+        req: dict = {
             "InstrumentID": req.symbol,
             "ExchangeID": req.exchange.value,
             "OrderRef": order_ref,
@@ -1199,7 +1222,7 @@ class RohonTdApi(TdApi):
         }
 
         self.reqid += 1
-        self.reqOrderAction(rohon_req, self.reqid)
+        self.reqOrderAction(req, self.reqid)
 
     def query_account(self) -> None:
         """查询资金"""
@@ -1220,7 +1243,7 @@ class RohonTdApi(TdApi):
         self.reqQryInvestorPosition(req, self.reqid)
 
     def query_settlement(self, trading_day: str = "") -> None:
-        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海早于 18:00 为前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
+        """发起一次 ReqQrySettlementInfo；未传 trading_day 时用 default_qday()（上海时区早于 18:00 用前一自然日，否则当天）。可传 yyyymmdd 或月结 yymm。"""
         if not self.login_status:
             self.gateway.write_log("尚未登录交易，跳过查询结算信息")
             return
